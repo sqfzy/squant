@@ -1,0 +1,31 @@
+strategies:
+  - name: "default"
+    type: "default"
+    data_source:
+      - exchange: "binance"
+        symbol: "BTC/USDT"
+        data_type: "kline"
+      - exchange: "binance"
+        symbol: "ETH/USDT"
+        data_type: "kline"
+    params:
+      max_retries: 3
+      retry_delay: 5
+      timeout: 30
+      backoff_factor: 1.5
+      jitter: true
+  - name: "high_volume"
+    type: "high_volume"
+    data_source:
+      - exchange: "binance"
+        symbol: "BTC/USDT"
+        data_type: "kline"
+      - exchange: "binance"
+        symbol: "ETH/USDT"
+        data_type: "kline"
+    params:
+      max_retries: 5
+      retry_delay: 2
+      timeout: 20
+      backoff_factor: 2.0
+      jitter: false
