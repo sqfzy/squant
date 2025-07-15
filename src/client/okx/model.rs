@@ -1,16 +1,12 @@
 #![allow(dead_code)]
 
-use std::marker::PhantomData;
-
-use crate::{
-    Timestamp,
-    data::{DataResponse, RawData},
-    order::Side,
-};
+use super::*;
+use crate::{Timestamp, order::Side};
 use bon::Builder;
 use bytestring::ByteString;
 use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
 
 pub(super) const OKX_CODE_SUCCESS: &str = "0";
 

@@ -2,9 +2,10 @@
 
 pub mod model;
 
+use super::*;
 use crate::{
     client::{DataGetter, DataSubscriber},
-    data::{CandleData, DataResponse, DataStream, RawData},
+    data::{CandleData, DataStream},
 };
 use bytestring::ByteString;
 use eyre::{Result, bail, eyre};

@@ -8,17 +8,6 @@ use std::task::Context;
 use std::task::Poll;
 use strum::EnumDiscriminants;
 
-// 通常你需要为每个Request和未标准化的交易所数据实现该trait
-pub trait RawData {
-    type Data;
-}
-
-// 通常你需要为每个Response实现该trait
-pub trait DataResponse {
-    /// 每个客户端的请求参数可能不同，因此需要为每个请求结果定义它的请求参数。
-    type Request;
-}
-
 #[derive(Debug, EnumDiscriminants)]
 #[strum_discriminants(vis(pub), name(MarketDataType), derive(Deserialize))]
 pub enum DataEnum {
