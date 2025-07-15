@@ -1,56 +1,65 @@
-use std::{fmt::format, sync::LazyLock};
+#![allow(dead_code)]
+
+pub mod model;
 
 use crate::{
-    Symbol,
     client::{DataGetter, DataSubscriber},
-    data::{CandleData, DataResponse, RawData, TradeData, okx::*},
+    data::{CandleData, DataResponse, DataStream, RawData},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD_ENGINE};
-use bon::Builder;
 use bytestring::ByteString;
-use chrono::{DateTime, SecondsFormat, Utc};
-use const_format::{concatcp, formatcp};
-use eyre::{Context, Result};
+use eyre::{Result, bail, eyre};
 use futures_util::{SinkExt, StreamExt};
-use hmac::{Hmac, Mac};
-use itertools::Itertools;
-use reqwest::{
-    Client,
-    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
-};
-use serde::Deserialize;
-use serde_with::{DisplayFromStr, serde_as};
-use sha2::Sha256;
+use http::Uri;
+use model::*;
+use reqwest::Client;
 use tokio_websockets::Message;
 use url::Url;
 
-use super::ExchangeTrait;
-
+// TODO: 支持不使用TLS
 pub struct OkxClientV5 {
+    base_http_url: Url,
+    base_ws_uri: Uri,
+
     client: Client,
     api_key: Option<ByteString>,        // 即 OK_ACCESS_KEY
     api_passphrase: Option<ByteString>, // 即 OK_ACCESS_PASSPHRASE
-    buffer: itoa::Buffer,               // 高效的整数转为字符串的缓冲区
+
+    itoa_buffer: itoa::Buffer, // 高效的整数转为字符串的缓冲区
+    bytes_buffer: Vec<u8>,
 }
 
+#[bon::bon]
 impl OkxClientV5 {
-    pub fn new() -> Self {
+    #[builder]
+    pub fn new(
+        #[builder(default = "https://www.okx.com/")] base_http_url: &str,
+        #[builder(default = "wss://wspap.okx.com/")] base_ws_uri: &str,
+    ) -> Result<Self> {
         let ok_access_key = std::env::var("OK_ACCESS_KEY").ok();
 
         let ok_access_passphrase = std::env::var("OK_ACCESS_PASSPHRASE").ok();
 
-        OkxClientV5 {
+        Ok(OkxClientV5 {
+            base_http_url: base_http_url.parse::<Url>()?,
+            base_ws_uri: base_ws_uri.parse::<Uri>()?,
             client: Client::new(),
             api_key: ok_access_key.map(Into::into),
             api_passphrase: ok_access_passphrase.map(Into::into),
-            buffer: itoa::Buffer::new(),
-        }
+            itoa_buffer: itoa::Buffer::new(),
+            bytes_buffer: Vec::new(),
+        })
     }
-}
 
-impl ExchangeTrait for OkxClientV5 {
-    const NAME: &'static str = "okx";
-    const BASE_URL: &'static str = "http://www.okx.com/";
+    fn with_buffer<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Vec<u8>) -> R,
+    {
+        self.bytes_buffer.clear();
+
+        f(&mut self.bytes_buffer)
+    }
+
+    // fn buffer_json() {}
 }
 
 impl DataGetter<OkxHttpResponse<OkxHttpCandleDataRequest>> for OkxClientV5 {
@@ -66,12 +75,12 @@ impl DataGetter<OkxHttpResponse<OkxHttpCandleDataRequest>> for OkxClientV5 {
             limit,
         } = params;
 
-        let mut uri = Url::parse(concatcp!(OkxClientV5::BASE_URL, "api/v5/market/candles"))?;
+        let mut url = Url::parse("https://www.okx.com/api/v5/market/candles")?;
 
         {
-            let mut query = uri.query_pairs_mut();
+            let mut query = url.query_pairs_mut();
 
-            let buffer = &mut self.buffer;
+            let buffer = &mut self.itoa_buffer;
             query.append_pair("instId", &inst_id);
             if let Some(bar) = bar {
                 query.append_pair("bar", bar.as_ref());
@@ -89,7 +98,7 @@ impl DataGetter<OkxHttpResponse<OkxHttpCandleDataRequest>> for OkxClientV5 {
 
         let resp = self
             .client
-            .get(uri)
+            .get(url)
             .send()
             .await?
             .error_for_status()?
@@ -100,25 +109,61 @@ impl DataGetter<OkxHttpResponse<OkxHttpCandleDataRequest>> for OkxClientV5 {
     }
 }
 
-impl DataSubscriber<OkxWebSocketResponse<OkxCandleData>> for OkxClientV5 {
+impl DataSubscriber<OkxWebSocketSubscribeResponse<OkxCandleData>> for OkxClientV5 {
     async fn subscribe_data(
         &mut self,
-        params: <OkxWebSocketResponse<OkxCandleData> as DataResponse>::Request,
-    ) -> Result<impl StreamExt<Item = <OkxWebSocketResponse<OkxCandleData> as RawData>::Data> + Send>
-    {
-        todo!()
+        params: <OkxWebSocketSubscribeResponse<OkxCandleData> as DataResponse>::Request,
+    ) -> Result<
+        impl StreamExt<Item = <OkxWebSocketSubscribeResponse<OkxCandleData> as RawData>::Data> + Send,
+    > {
+        let (mut client, _) = tokio_websockets::client::Builder::new()
+            .uri("wss://wspap.okx.com/ws/v5/business")?
+            .connect()
+            .await?;
+
+        client
+            .send(Message::text(simd_json::serde::to_string(&params)?))
+            .await?;
+
+        let _resp = if let Some(Ok(msg)) = client.next().await
+            && let Some(text) = msg.as_text()
+        {
+            simd_json::serde::from_slice::<OkxWebSocketSubscribeResponse<OkxCandleData>>(
+                &mut text.to_string().into_bytes(),
+            )?
+        } else {
+            bail!("Failed to subscribe to OKX WebSocket channel")
+        };
+
+        let stream: DataStream<Result<Vec<CandleData>>, _, _, _> =
+            DataStream::new(client, |msg| -> Result<_> {
+                let msg = msg?;
+                let text = msg
+                    .as_text()
+                    .ok_or_else(|| eyre!("Received non-text message from WebSocket: {:?}", msg))?;
+                let resp = simd_json::serde::from_slice::<OkxWebSocketDataResponse<OkxCandleData>>(
+                    &mut text.to_string().into_bytes(),
+                )?;
+
+                resp.data
+                    .into_iter()
+                    .map(CandleData::try_from)
+                    .collect::<Result<_>>()
+            });
+
+        Ok(stream)
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn create_okx_client_v5() {
-        OkxClientV5::new();
-    }
-}
+// #[cfg(test)]
+// mod test {
+//     use super::*;
+//
+//     // #[test]
+//     // fn create_okx_client_v5() {
+//     //     OkxClientV5::new();
+//     // }
+// }
 
 //
 //     // async fn get_datas(

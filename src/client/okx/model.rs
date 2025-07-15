@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::marker::PhantomData;
 
 use crate::{
@@ -7,12 +9,10 @@ use crate::{
 };
 use bon::Builder;
 use bytestring::ByteString;
-use eyre::{Context, Result, eyre};
+use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
-use tokio_websockets::{MaybeTlsStream, WebSocketStream};
 
-const CODE_SUCCESS: &str = "0";
+pub(super) const OKX_CODE_SUCCESS: &str = "0";
 
 #[derive(Debug, Deserialize)]
 pub struct OkxHttpResponse<D: RawData> {
@@ -88,42 +88,58 @@ pub struct OkxArg {
     pub inst_id: ByteString,
 }
 
+impl OkxArg {
+    pub fn new(channel: impl Into<ByteString>, inst_id: impl Into<ByteString>) -> Self {
+        Self {
+            channel: channel.into(),
+            inst_id: inst_id.into(),
+        }
+    }
+}
+
 #[derive(Builder, Serialize)]
-pub struct OkxWebRequest<D> {
+pub struct OkxWebSocketSubscribeRequest<D> {
+    /// 操作
+    /// subscribe
+    /// unsubscribe
+    #[builder(start_fn, into)]
+    pub op: ByteString,
+    /// 请求订阅的频道列表
+    #[builder(start_fn, into)]
+    pub args: Vec<OkxArg>,
+
     /// 消息的唯一标识。
     /// 用户提供，返回参数中会返回以便于找到相应的请求。
     /// 字母（区分大小写）与数字的组合，可以是纯字母、纯数字且长度必须要在1-32位之间。
     pub id: Option<ByteString>,
-    /// 操作
-    /// subscribe
-    /// unsubscribe
-    pub op: ByteString,
-    /// 请求订阅的频道列表
-    pub args: Vec<OkxArg>,
-    /// 产品ID
-    pub inst_id: ByteString,
 
     #[serde(skip)]
+    #[builder(skip)]
     _phantom: PhantomData<D>,
 }
 
-impl<D: RawData> RawData for OkxWebRequest<D> {
+impl<D: RawData> RawData for OkxWebSocketSubscribeRequest<D> {
     type Data = D::Data;
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OkxWebSocketResponse<D> {
+pub struct OkxWebSocketSubscribeResponse<D> {
     /// 消息的唯一标识。
     pub id: Option<ByteString>,
+
     /// 事件类型
     pub event: ByteString,
+
     /// 错误码
     pub code: Option<ByteString>,
+
     /// 错误消息
     pub msg: Option<ByteString>,
+
     /// 订阅的频道
     pub arg: OkxArg,
+
     /// WebSocket连接ID
     pub conn_id: ByteString,
 
@@ -131,12 +147,19 @@ pub struct OkxWebSocketResponse<D> {
     _phantom: PhantomData<D>,
 }
 
-impl<D: RawData> RawData for OkxWebSocketResponse<D> {
-    type Data = WebSocketStream<MaybeTlsStream<TcpStream>>;
+impl<D: RawData> RawData for OkxWebSocketSubscribeResponse<D> {
+    type Data = Result<Vec<D::Data>>;
 }
 
-impl<D> DataResponse for OkxWebSocketResponse<D> {
-    type Request = OkxWebRequest<D>;
+impl<D> DataResponse for OkxWebSocketSubscribeResponse<D> {
+    type Request = OkxWebSocketSubscribeRequest<D>;
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OkxWebSocketDataResponse<D> {
+    pub arg: OkxArg,
+    pub data: Vec<D>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,7 +173,7 @@ pub struct OkxTradeData {
     pub ts: ByteString,
 }
 
-impl TryFrom<OkxTradeData> for super::TradeData {
+impl TryFrom<OkxTradeData> for crate::data::TradeData {
     type Error = eyre::Report;
 
     fn try_from(value: OkxTradeData) -> Result<Self> {
@@ -193,7 +216,7 @@ pub struct OkxBookData {
     pub ts: ByteString,
 }
 
-impl TryFrom<OkxBookData> for super::BookData {
+impl TryFrom<OkxBookData> for crate::data::BookData {
     type Error = eyre::Report;
 
     fn try_from(value: OkxBookData) -> Result<Self> {

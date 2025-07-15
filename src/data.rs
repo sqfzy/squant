@@ -1,16 +1,12 @@
-pub mod okx;
-pub mod pubsub;
-
-use crate::Symbol;
 use crate::Timestamp;
 use crate::order::Side;
 use bytestring::ByteString;
-use eyre::Result;
+use futures_util::Stream;
 use serde::Deserialize;
-use serde::Serialize;
-use strum::AsRefStr;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
 use strum::EnumDiscriminants;
-use strum::{Display, EnumString, IntoStaticStr};
 
 // 通常你需要为每个Request和未标准化的交易所数据实现该trait
 pub trait RawData {
@@ -71,7 +67,44 @@ pub struct BookData {
     pub timestamp: Timestamp,
 }
 
+#[pin_project::pin_project]
+pub struct DataStream<D, I, S, F>
+where
+    S: Stream<Item = I>,
+    F: FnMut(I) -> D,
+{
+    #[pin]
+    stream: S,
+    mapper: F,
+}
 
+impl<D, I, S, F> DataStream<D, I, S, F>
+where
+    S: Stream<Item = I>,
+    F: FnMut(I) -> D,
+{
+    pub fn new(stream: S, mapper: F) -> Self {
+        Self { stream, mapper }
+    }
+}
+
+impl<D, I, S, F> Stream for DataStream<D, I, S, F>
+where
+    S: Stream<Item = I>,
+    F: FnMut(I) -> D,
+{
+    type Item = D;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        let stream: Pin<&mut S> = this.stream;
+        let mapper: &mut F = this.mapper;
+
+        let poll_result = stream.poll_next(cx);
+
+        poll_result.map(|option_i| option_i.map(mapper))
+    }
+}
 
 // #[derive(
 //     Debug,
