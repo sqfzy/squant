@@ -1,5 +1,6 @@
 use eyre::Result;
 use futures_util::StreamExt;
+use rustls::crypto::aws_lc_rs::default_provider;
 use squant::{
     client::{
         DataSubscriber,
@@ -10,45 +11,64 @@ use squant::{
     },
     data::BookData,
 };
-use std::{net::TcpStream, time::UNIX_EPOCH};
-use tungstenite::{connect, stream::NoDelay};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::UNIX_EPOCH,
+};
+use tungstenite::connect;
 use url::Url;
 
+/// 程序主入口，用于启动延迟测试
 #[tokio::main]
 async fn main() -> Result<()> {
-    std::fs::create_dir_all("temp");
+    default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
 
-    let times = 100;
-    let res = async_ws(times).await?;
-    record_res("temp/async_ws.csv", res)?;
+    // 确保用于存放结果的目录存在
+    std::fs::create_dir_all("temp").unwrap();
 
-    let res = poll_ws(times);
-    record_res("temp/poll_ws.csv", res)?;
+    let times = 1000; // 每批次收集的数据点数量
+    let num_threads = num_cpus::get(); // 获取 CPU 核心数用于多线程测试
+
+    // println!("开始进行异步 WebSocket 延迟测试...");
+    //     async_ws(times).await.ok();
+
+    // 多线程测试默认被注释掉，可以取消注释来运行
+    println!("开始进行多线程同步 WebSocket 延迟测试...");
+    poll_ws_multithread(num_threads, times);
 
     Ok(())
 }
 
-fn record_res(path: &str, data: Vec<u128>) -> Result<()> {
+/// 将延迟数据记录到 CSV 文件
+///
+/// # Arguments
+/// * `path` - 输出的 CSV 文件路径
+/// * `data` - 包含延迟时间（毫秒）的向量
+fn record_res(path: &str, data: &Vec<u128>) -> Result<()> {
     let mut writer = csv::Writer::from_path(path)?;
 
     // 写入表头
     writer.write_record(["duration_ms"])?;
 
     // 逐行写入数据
-    for duration in data {
+    for &duration in data {
         writer.write_record(&[duration.to_string()])?;
     }
 
     // 确保所有内容都写入文件
     writer.flush()?;
 
-    println!("数据已成功保存到 {path}");
+    println!("数据已成功保存到 {}", path);
     Ok(())
 }
 
-async fn async_ws(mut times: usize) -> Result<Vec<u128>> {
-    let mut result = Vec::with_capacity(times);
-
+async fn async_ws(times: usize) -> Result<()> {
     let mut client = OkxClientV5::builder().build()?;
 
     let params: OkxWsRequest<OkxBookData> =
@@ -60,103 +80,126 @@ async fn async_ws(mut times: usize) -> Result<Vec<u128>> {
     )
     .await?;
 
-    while let Some(Ok(data)) = stream.next().await {
-        if times == 0 {
-            break;
+    let mut result = Vec::with_capacity(times);
+    let mut batch_index = 0; // 使用简单的批次索引
+
+    // 在同一个 stream 上持续循环
+    while let Some(Ok(data_vec)) = stream.next().await {
+        if let Some(data) = data_vec.get(0) {
+            let now = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let ts = data.timestamp;
+
+            let elapsed = now.abs_diff(ts);
+            result.push(elapsed);
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let ts = data[0].timestamp;
+        // 当收集到足够的数据时，记录并重置
+        if result.len() >= times {
+            let path = format!("temp/async_ws_{}.csv", batch_index);
+            record_res(&path, &result).ok();
 
-        // println!("debug0: now: {now}, ts: {ts}");
-        let elapsed = now.abs_diff(ts);
-        result.push(elapsed);
-        // println!("debug0: elapsed: {elapsed}");
-
-        times -= 1;
+            result.clear();
+            batch_index += 1; // 为下一个文件准备索引
+        }
     }
 
-    Ok(result)
+    Ok(()) // 正常情况下，这个循环是无限的，除非 stream 中断
 }
 
-fn poll_ws(mut times: usize) -> Vec<u128> {
-    let mut result = Vec::with_capacity(times);
+/// 使用多个同步线程进行 WebSocket 延迟测试
+///
+/// 每个线程独立连接到 WebSocket 并轮询消息。
+fn poll_ws_multithread(num_threads: usize, times: usize) {
+    let k = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(num_threads);
 
-    // 1. CORRECT: 定义并解析完整的、正确的 WSS URL
-    let url_str = "wss://wspap.okx.com:443/ws/v5/public";
-    let url = Url::parse(url_str).expect("Invalid URL");
+    for _ in 0..num_threads {
+        let k = k.clone();
 
-    // 2. CORRECT: 使用 `tungstenite::connect` 来处理整个连接过程（TCP + TLS + WebSocket握手）
-    //    这个函数会返回一个已经可以通信的 WebSocket<Stream>
-    let (mut socket, response) = connect(url).expect("Failed to connect");
+        let handle = std::thread::spawn(move || {
+            let url_str = "wss://wspap.okx.com/ws/v5/public";
+            let url = Url::parse(url_str).expect("Invalid URL");
+            let (mut socket, _) = connect(url).expect("Failed to connect");
 
-    println!("Successfully connected to OKX WebSocket API.");
-    println!("HTTP Response: {}", response.status());
+            let stream_ref = match socket.get_mut() {
+                tungstenite::stream::MaybeTlsStream::Rustls(tls_stream) => tls_stream.get_mut(),
+                _ => {
+                    panic!(
+                        "Expected a TLS stream, ensure you have a TLS feature enabled for tungstenite."
+                    )
+                }
+            };
+            stream_ref
+                .set_nonblocking(true)
+                .expect("Failed to set non-blocking on the underlying stream");
 
-    // 3. KEY STEP: *在连接成功后*，获取底层流的引用并设置为非阻塞
-    let stream_ref = match socket.get_mut() {
-        tungstenite::stream::MaybeTlsStream::NativeTls(tls_stream) => tls_stream.get_mut(),
-        _ => {
-            panic!("Expected a TLS stream, ensure you have a TLS feature enabled for tungstenite.")
-        }
-    };
-    stream_ref
-        .set_nonblocking(true)
-        .expect("Failed to set non-blocking on the underlying stream");
-
-    let params: OkxWsRequest<OkxBookData> =
-        OkxWsRequest::<OkxBookData>::builder("subscribe", vec![OkxArg::new("bbo-tbt", "BTC-USDT")])
+            let params: OkxWsRequest<OkxBookData> = OkxWsRequest::<OkxBookData>::builder(
+                "subscribe",
+                vec![OkxArg::new("bbo-tbt", "BTC-USDT")],
+            )
             .build();
-    socket
-        .send(tungstenite::Message::Text(
-            simd_json::serde::to_string(&params).unwrap().into(),
-        ))
-        .unwrap();
+            socket
+                .send(tungstenite::Message::Text(
+                    simd_json::serde::to_string(&params).unwrap().into(),
+                ))
+                .unwrap();
 
-    // 3. 进入无限循环，不停地尝试读取消息
-    let mut success = false;
-    loop {
-        match socket.read() {
-            // A. 成功读取到消息
-            Ok(msg) => {
-                if !success {
-                    success = true;
-                    continue;
+            // 等待订阅成功的回应
+            if let Ok(_) = socket.read() {
+                // 忽略第一个成功消息
+            }
+
+            loop {
+                let mut result = Vec::with_capacity(times);
+
+                socket.read().ok();
+
+                while result.len() < times {
+                    match socket.read() {
+                        Ok(msg) => {
+                            let text = match msg.to_text() {
+                                Ok(t) => t,
+                                Err(_) => continue, // 忽略非文本消息
+                            };
+
+                            if let Ok(resp) = simd_json::from_slice::<OkxWsDataResponse<OkxBookData>>(
+                                &mut text.to_string().into_bytes(),
+                            ) {
+                                if let Ok(book_data_vec) = resp
+                                    .data
+                                    .into_iter()
+                                    .map(BookData::try_from)
+                                    .collect::<Result<Vec<_>>>()
+                                {
+                                    if let Some(data) = book_data_vec.get(0) {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis();
+                                        let ts = data.timestamp;
+                                        let elapsed = now.abs_diff(ts);
+                                        result.push(elapsed);
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => continue,
+                    }
                 }
 
-                if times == 0 {
-                    break;
-                }
-
-                let text = msg.to_text().unwrap();
-                let resp: OkxWsDataResponse<OkxBookData> =
-                    simd_json::from_slice(&mut text.to_string().into_bytes()).unwrap();
-                let data = resp
-                    .data
-                    .into_iter()
-                    .map(BookData::try_from)
-                    .collect::<Result<Vec<_>>>()
-                    .unwrap();
-                let ts = data[0].timestamp;
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis();
-
-                let elapsed = now.abs_diff(ts);
-                result.push(elapsed);
-
-                times -= 1;
+                let file_index = k.fetch_add(1, Ordering::Relaxed);
+                let path = format!("temp/poll_ws_multithread_{}.csv", file_index);
+                record_res(&path, &result).ok();
             }
-            _ => {
-                continue;
-            }
-        }
+        });
+
+        handles.push(handle);
     }
 
-    result
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }
