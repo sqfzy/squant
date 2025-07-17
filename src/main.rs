@@ -21,7 +21,7 @@ use std::{
 use tungstenite::connect;
 use url::Url;
 
-const FLUSH_SIZE: usize = 2;
+const FLUSH_SIZE: usize = 1000;
 
 #[derive(clap::Parser)]
 struct Cli {
@@ -33,6 +33,7 @@ struct Cli {
 enum Process {
     AsyncWs,
     PollWsMultithread,
+    PollWs,
     BusyPollWs,
 }
 
@@ -57,6 +58,11 @@ async fn main() -> Result<()> {
             let num_threads = num_cpus::get();
             poll_ws_multithread(num_threads, tx);
             record_res_deduplication("poll_ws_multithread.csv", rx);
+        }
+        Process::PollWs => {
+            println!("开始进行单线程 WebSocket 延迟测试...");
+            std::thread::spawn(move || poll_ws(tx));
+            record_res("poll_ws.csv", rx);
         }
         Process::BusyPollWs => {
             println!("开始进行忙轮询 WebSocket 延迟测试...");
@@ -146,6 +152,53 @@ fn poll_ws_multithread(num_threads: usize, tx: Sender<u128>) {
                 }
             }
         });
+    }
+}
+
+fn poll_ws(tx: Sender<u128>) {
+    let tx = tx.clone();
+
+    let url_str = "wss://wspap.okx.com/ws/v5/public";
+    let url = Url::parse(url_str).expect("Invalid URL");
+    let (mut socket, _) = connect(url).expect("Failed to connect");
+
+    let stream_ref = match socket.get_mut() {
+        tungstenite::stream::MaybeTlsStream::Rustls(tls_stream) => tls_stream.get_mut(),
+        _ => {
+            panic!("Expected a TLS stream, ensure you have a TLS feature enabled for tungstenite.")
+        }
+    };
+    stream_ref
+        .set_nonblocking(true)
+        .expect("Failed to set non-blocking on the underlying stream");
+
+    let params: OkxWsRequest<OkxBookData> =
+        OkxWsRequest::<OkxBookData>::builder("subscribe", vec![OkxArg::new("bbo-tbt", "BTC-USDT")])
+            .build();
+    socket
+        .send(tungstenite::Message::Text(
+            simd_json::serde::to_string(&params).unwrap().into(),
+        ))
+        .unwrap();
+
+    // 忽略第一个成功消息
+    socket.read().ok();
+
+    loop {
+        if let Ok(msg) = socket.read()
+            && let Ok(text) = msg.to_text()
+            && let Ok(resp) = simd_json::from_slice::<OkxWsDataResponse<OkxBookData>>(
+                &mut text.to_string().into_bytes(),
+            )
+            && let Ok(book_data_vec) = resp
+                .data
+                .into_iter()
+                .map(BookData::try_from)
+                .collect::<Result<Vec<_>>>()
+            && let Some(data) = book_data_vec.first()
+        {
+            tx.send(calc_elapsed(data.timestamp)).ok();
+        }
     }
 }
 

@@ -1,85 +1,79 @@
-import io
-import os
+from cProfile import label
 
+import matplotlib.pyplot as plt
 import pandas as pd
-import sweetviz as sv
+import seaborn as sns
+import ydata_profiling
 
 
-def load_and_combine_csvs(base_filename_pattern: str) -> pd.DataFrame | None:
+def get_data(name: str):
     """
-    按顺序加载形如 'pattern_{i}.csv' 的文件，直到文件不存在为止，
-    并将它们合并成一个 Polars DataFrame。
-
-    Args:
-        base_filename_pattern: 文件名的格式化字符串，例如 "async_ws"
-
-    Returns:
-        一个包含所有数据的 Polars DataFrame，并额外添加了 'file_index' 列。
-        如果找不到任何文件，则返回 None。
+    获取数据集
+    :param name: 数据集名称
+    :return: 数据集的 DataFrame
     """
-    i = 0
-    dfs_to_concat = []  # 用于存放每个文件的 DataFrame
-
-    while True:
-        filename = f"temp/{base_filename_pattern}_{i}.csv"
-        if os.path.exists(filename):
-            print(f"正在读取文件: {filename}")
-            # 读取CSV文件
-            try:
-                temp_df = pd.read_csv(filename)
-                dfs_to_concat.append(temp_df)
-                i += 1
-            except Exception as e:
-                print(f"读取文件 {filename} 时出错: {e}")
-                break
-        else:
-            print(f"文件 {filename} 不存在，停止加载。")
-            break
-
-    if not dfs_to_concat:
-        print("未找到任何可加载的文件。")
+    try:
+        df = pd.read_csv(f"{name}.csv")
+        print(f"成功加载 {name} 数据集")
+        return df
+    except FileNotFoundError:
+        print(f"数据集 {name} 不存在!")
         return None
 
-    # 使用 pl.concat 高效地将列表中的所有 DataFrame 合并为一个
-    print(f"\n成功加载 {len(dfs_to_concat)} 个文件，正在合并...")
-    combined_df: pd.DataFrame = pd.concat(dfs_to_concat)
 
-    print("\nDataFrame 的前5行:")
-    print(combined_df.head())
+def gen_report(name: str, data: pd.DataFrame):
+    """
+    生成数据报告
+    :param name: 数据集名称
+    """
+    profile = ydata_profiling.ProfileReport(data, title=f"{name} Performance Report")
+    profile.to_file(f"{name}_report.html")
+    print(f"{name} 数据集的报告已保存为 {name}_report.html")
+    return profile
 
-    print("\nDataFrame 的统计摘要:")
-    print(combined_df.describe())
 
-    return combined_df
+names = [
+    "async_ws",
+    # "poll_ws_multithread",
+    "poll_ws",
+    "busy_poll_ws",
+]
+datas = [d for n in names if (d := get_data(n)) is not None]
+min_len = min(len(d) for d in datas)
+datas_dict: dict[str, pd.DataFrame] = {
+    n: d for n, d in zip(names, datas)
+}
 
+reports = [gen_report(n, d) for n, d in datas_dict.items()]
+compare_report = ydata_profiling.compare(reports)
 
-from ydata_profiling import ProfileReport
+# compare_report.to_file("compare_report.html", False)
 
-print("正在加载 async_ws 数据...")
-df_async = load_and_combine_csvs("async_ws")
+for name, df in datas_dict.items():
+    df["dataset"] = name
 
-print("正在加载 poll_ws_multithread 数据...")
-df_poll = load_and_combine_csvs("poll_ws_multithread")
+combined_df = pd.concat(datas_dict.values())
 
-# 对齐df高度
-if df_async is not None and df_poll is not None:
-    min_length = min(len(df_async), len(df_poll))
-    df_async = df_async.iloc[:min_length]
-    df_poll = df_poll.iloc[:min_length]
+plt.figure(figsize=(12, 7))
 
-print("正在为 'Async' 数据生成报告...")
-profile_async = ProfileReport(df_async, title="Async WS Performance")
-
-# --- 3. 核心步骤：比较两个报告 ---
-print("正在将 'Polling' 数据与 'Async' 数据进行比较...")
-comparison_report = profile_async.compare(
-    ProfileReport(df_poll, title="Polling Multithread Performance")
+# 使用 seaborn.histplot 进行绘图
+# hue='dataset' 是这里的关键，它告诉seaborn根据'dataset'列的值为数据分组并使用不同颜色
+# stat='density' 和 common_norm=False 确保每个分布都被归一化，使得总样本量不同的数据集也能公平比较
+sns.histplot(
+    data=combined_df,
+    x="duration_ms",
+    hue="dataset",
+    bins=50,
+    kde=True,  # 添加核密度估计曲线，让分布更平滑
+    stat="density",  # 将Y轴转换为密度而非计数，便于比较
+    common_norm=False,  # 每个分布独立归一化
+    element="step",  # 使用'step'或'poly'，'step'更清晰
 )
 
-# --- 4. 将对比报告保存为 HTML 文件 ---
-print("正在将对比报告保存到文件...")
-comparison_report.to_file("performance_comparison_ydata.html")
+plt.xlabel("Duration (ms)", fontsize=12)
+plt.ylabel("Density", fontsize=12)
+plt.tight_layout()
 
-print(
-    "\n分析完成！请在浏览器中打开 'performance_comparison_ydata.html' 查看交互式对比结果。"
-)
+output_filename = "comapre result.svg"
+plt.savefig(output_filename)
+print(f"叠加直方图已保存为: {output_filename}")
