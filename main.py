@@ -1,6 +1,6 @@
 from cProfile import label
 
-import matplotlib.pyplot as plt
+import plotly.express as px 
 import pandas as pd
 import seaborn as sns
 import ydata_profiling
@@ -45,8 +45,7 @@ datas_dict: dict[str, pd.DataFrame] = {
 }
 
 reports = [gen_report(n, d) for n, d in datas_dict.items()]
-compare_report = ydata_profiling.compare(reports)
-
+# compare_report = ydata_profiling.compare(reports)
 # compare_report.to_file("compare_report.html", False)
 
 for name, df in datas_dict.items():
@@ -54,26 +53,16 @@ for name, df in datas_dict.items():
 
 combined_df = pd.concat(datas_dict.values())
 
-plt.figure(figsize=(12, 7))
-
-# 使用 seaborn.histplot 进行绘图
-# hue='dataset' 是这里的关键，它告诉seaborn根据'dataset'列的值为数据分组并使用不同颜色
-# stat='density' 和 common_norm=False 确保每个分布都被归一化，使得总样本量不同的数据集也能公平比较
-sns.histplot(
-    data=combined_df,
-    x="duration_ms",
-    hue="dataset",
-    bins=50,
-    kde=True,  # 添加核密度估计曲线，让分布更平滑
-    stat="density",  # 将Y轴转换为密度而非计数，便于比较
-    common_norm=False,  # 每个分布独立归一化
-    element="step",  # 使用'step'或'poly'，'step'更清晰
+fig = px.histogram(
+    combined_df,
+    x='duration_ms',
+    color='dataset',
+    marginal='rug',
+    histnorm='density',
+    opacity=0.7,
+    title=f"Performance Compare",
 )
 
-plt.xlabel("Duration (ms)", fontsize=12)
-plt.ylabel("Density", fontsize=12)
-plt.tight_layout()
-
-output_filename = "comapre result.svg"
-plt.savefig(output_filename)
-print(f"叠加直方图已保存为: {output_filename}")
+output_filename = "performance compare.html"
+fig.write_html(output_filename)
+print(f"比较结果已保存至: {output_filename}")

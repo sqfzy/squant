@@ -13,11 +13,12 @@ use squant::{
     },
     data::BookData,
 };
-use std::time::UNIX_EPOCH;
 use std::{
     collections::BTreeSet,
+    path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
 };
+use std::{fs::create_dir_all, time::UNIX_EPOCH};
 use tungstenite::connect;
 use url::Url;
 
@@ -27,6 +28,9 @@ const FLUSH_SIZE: usize = 1000;
 struct Cli {
     #[clap(short, long)]
     process: Process,
+
+    #[clap(short, long, default_value = "")]
+    output_dir: String,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -44,6 +48,8 @@ async fn main() -> Result<()> {
         .expect("Failed to install rustls crypto provider");
 
     let cli = Cli::parse();
+    let dir = cli.output_dir;
+    create_dir_all(PathBuf::from(&dir)).unwrap();
 
     let (tx, rx) = mpsc::channel();
 
@@ -51,23 +57,23 @@ async fn main() -> Result<()> {
         Process::AsyncWs => {
             println!("开始进行异步 WebSocket 延迟测试...");
             tokio::spawn(async_ws(tx));
-            record_res("async_ws.csv", rx);
+            record_res(&format!("{dir}async_ws.csv"), rx);
         }
         Process::PollWsMultithread => {
             println!("开始进行多线程 WebSocket 延迟测试...");
             let num_threads = num_cpus::get();
             poll_ws_multithread(num_threads, tx);
-            record_res_deduplication("poll_ws_multithread.csv", rx);
+            record_res_deduplication(&format!("{dir}poll_ws_multithread.csv"), rx);
         }
         Process::PollWs => {
             println!("开始进行单线程 WebSocket 延迟测试...");
             std::thread::spawn(move || poll_ws(tx));
-            record_res("poll_ws.csv", rx);
+            record_res(&format!("{dir}poll_ws.csv.csv"), rx);
         }
         Process::BusyPollWs => {
             println!("开始进行忙轮询 WebSocket 延迟测试...");
             std::thread::spawn(|| busy_poll_ws(tx));
-            record_res("busy_poll_ws.csv", rx);
+            record_res(&format!("{dir}busy_poll_ws.csv.csv"), rx);
         }
     }
 
